@@ -151,7 +151,11 @@ class TrainingCoordinator(object):
             teacher_tokens = student.tokenizer.tokenize_typed(teacher_text)
             teacher_texts = [t.text for t in teacher_tokens]
             student.memory.observe_sequence(input_tokens, class_bit=target_class)
-            student.memory.observe_sequence(teacher_tokens, class_bit=target_class)
+            # anchor=True wraps the answer in <bos>...<eos>, which is what
+            # teaches the generator where an answer starts and stops.
+            student.memory.observe_sequence(teacher_tokens, class_bit=target_class,
+                                            anchor=True)
+            student.memory.observe_association(input_texts, teacher_texts)
 
         # routing happens once per turn, not once per candidate ----------
         experts = student.route(input_features)

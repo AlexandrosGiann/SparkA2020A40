@@ -60,11 +60,19 @@ class TestSaving(PersistenceTestBase):
         self.assertIn("γεια", content)
 
     def test_saving_is_idempotent(self):
+        """Saving twice without training must not change the state.
+
+        The byte size may differ by a character because ``saved_at`` is a
+        timestamp, so compare the state itself rather than the file length.
+        """
         coordinator = self.make_coordinator()
         coordinator.save()
-        first = self.persistence.size_bytes()
+        with open(self.path, encoding="utf-8") as handle:
+            first = json.load(handle)["state"]
         coordinator.save()
-        self.assertEqual(self.persistence.size_bytes(), first)
+        with open(self.path, encoding="utf-8") as handle:
+            second = json.load(handle)["state"]
+        self.assertEqual(first, second)
 
 
 class TestLoading(PersistenceTestBase):

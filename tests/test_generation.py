@@ -40,8 +40,11 @@ class TestCandidateGeneration(unittest.TestCase):
         candidates = self.student.candidate_tokens(["γεια"], [])
         self.assertIn("σου", candidates)
 
-    def test_eos_is_always_offered(self):
-        self.assertIn(EOS, self.student.candidate_tokens(["γεια"], []))
+    def test_eos_is_offered_once_there_is_output(self):
+        """An answer may end -- but it may not be empty, so <eos> is withheld
+        at step 0."""
+        self.assertNotIn(EOS, self.student.candidate_tokens(["γεια"], []))
+        self.assertIn(EOS, self.student.candidate_tokens(["γεια"], ["γεια", "σου"]))
 
     def test_unknown_placeholder_is_never_offered(self):
         self.assertNotIn(UNK, self.student.candidate_tokens(["γεια"], []))

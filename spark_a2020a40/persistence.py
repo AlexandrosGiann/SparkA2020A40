@@ -22,7 +22,7 @@ import os
 import tempfile
 import time
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 LEGACY_FILE = "bittreelm_memory.json"
 
 

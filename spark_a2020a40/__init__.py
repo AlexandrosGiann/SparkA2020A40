@@ -10,10 +10,10 @@ f-strings and dataclasses so that it stays parsable by the older Python 3
 interpreters shipped with QPython 3H / Pydroid.
 """
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 __author__ = "Alexandros Giannakis"
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 __all__ = [
     "__version__",
@@ -26,6 +26,7 @@ __all__ = [
     "AdaptiveQuadraticNeuron",
     "Expert",
     "ExpertPool",
+    "MarkovScorer",
     "Router",
     "RewardEngine",
     "ReplayBuffer",
@@ -55,6 +56,9 @@ def __getattr__(name):
     if name in ("Expert", "ExpertPool"):
         from . import experts as _m
         return getattr(_m, name)
+    if name == "MarkovScorer":
+        from .markov import MarkovScorer
+        return MarkovScorer
     if name == "Router":
         from .router import Router
         return Router

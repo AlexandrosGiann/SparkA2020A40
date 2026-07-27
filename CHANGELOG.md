@@ -1,5 +1,64 @@
 # Changelog
 
+## 2.1.0 — Markov backbone for generation
+
+v2.0 could score a token but could not order one. The n-gram statistics were
+already being collected correctly — `P(σου | γεια) = 1.0` — but they entered
+generation as three features among eighteen, feeding an expert whose weights
+start at zero. A perfect ordering signal was diluted into noise.
+
+### Fixed
+
+* **Answers could not end.** `observe_sequence` recorded the teacher response
+  without anchors, so `<eos>` was never a successor of anything (`count: 0`)
+  and `<bos>` had no successors at all. The model had no representation of
+  where a reply starts or stops, and generated until it hit the token cap,
+  concatenating unrelated lessons. Sequences are now anchored as
+  `<bos> … <eos>` via `observe_sequence(..., anchor=True)`.
+* **The topic term punished silence.** The question/answer association score
+  was a log-probability, so every token never seen with the question got a
+  large negative score — including `<eos>`, which by construction never appears
+  in an association table. It is now a bounded *bonus*, `log(1 + gain·p)`,
+  which is exactly 0 without evidence.
+* **`pos[1]`/`pos[2]` are skip-grams, not trigrams.** They answer "what appears
+  two positions after X", not "what follows the pair (X, Y)". A real order-2
+  context table was added; the skip-grams remain as features.
+
+### Added
+
+* `markov.py` — `MarkovScorer` with stupid backoff (Brants et al. 2007):
+  trigram → bigram → unigram with α = 0.4, plus `perplexity()` for diagnostics.
+* `TokenMemory.contexts` — bounded order-2 context table (real trigrams),
+  capped by `max_contexts` and `max_successors_per_context`.
+* `TokenMemory.associations` — bounded question-token → answer-token table.
+  Without it a pure Markov chain starts every answer at `<bos>` and replies
+  identically to every question.
+* Generation is now a log-linear blend: `w_markov · log S + w_assoc · bonus +
+  w_expert · correction`, with the expert contribution squashed to [-1, 1] so an
+  unbounded logit cannot drown the language model.
+* `tests/test_markov.py` — 38 tests covering anchoring, contexts, backoff,
+  associations, candidate sets and end-to-end generation quality.
+* Schema bumped to **v3**. v2 and v1 files still load; contexts and
+  associations simply start empty and rebuild as the model learns.
+
+### Changed
+
+* `w_assoc` default 0.6 → **3.0** and `temperature` 0.7 → **0.1**, both chosen
+  by measurement on two corpora (Greek and English), not by taste. On the Greek
+  set the exact-reproduction rate went 55% → 93%; on the harder English set
+  27% → 68%.
+* `candidate_tokens` delegates to `MarkovScorer.candidates`, so generation and
+  distillation always see the same candidates.
+* `<eos>` is no longer offered at step 0 — an answer may end, but not be empty.
+* `generate()` returns `finished`, indicating the model stopped on `<eos>`
+  rather than hitting the cap.
+
+### Measured effect
+
+Teacher agreement over 120 benchmark turns went from 0.35 → **1.0**, and mean
+reward from +0.55 → **+0.99**, with latency unchanged (20 ms/turn training,
+11 ms inference) and 4.5 KB more state.
+
 ## 2.0.0 — teacher/student rewrite
 
 The flat 372-line `spark_a2020a40.py` became the `spark_a2020a40/` package.
@@ -84,7 +143,7 @@ the old memory file loads.
   :freeze :unfreeze :train :retrain :memory :class :debug :help`.
 * `benchmark.py` — latency, peak memory, active experts, reward/accuracy,
   memory JSON size.
-* **10 test modules, 223 tests**, standard-library `unittest` only, including
+* **11 test modules, 261 tests**, standard-library `unittest` only, including
   the mandated adaptive-neuron regressions (circle, linear, the six-point
   dataset, L1-versus-necessary-curvature) and the selective-retraining test.
 * `examples/migrate_legacy_memory.py` and `examples/session_example.md`.

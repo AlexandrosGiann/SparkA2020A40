@@ -17,6 +17,14 @@ from .tokenizer import EOS, UNK, BOS
 
 MAX_ORDER = 3
 
+#: Separator used to flatten a multi-token context into a JSON-safe dict key.
+CONTEXT_SEP = "\u0001"
+
+
+def context_key(previous_two):
+    """``("γεια", "σου") -> "γεια\x01σου"``."""
+    return CONTEXT_SEP.join(previous_two)
+
 
 class TokenRecord(object):
     __slots__ = ("tid", "kind", "count", "pos", "cls0", "cls1",
@@ -47,7 +55,7 @@ class TokenMemory(object):
     """Bounded token store with positional statistics of order 1..3."""
 
     __slots__ = ("cfg", "tokens", "_free_ids", "_next_id", "_clock",
-                 "_max_count", "total_observations")
+                 "_max_count", "total_observations", "contexts", "associations")
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -57,6 +65,14 @@ class TokenMemory(object):
         self._clock = 0
         self._max_count = 1
         self.total_observations = 0
+        # Order-2 contexts: (w-2, w-1) -> {successor: count}.  These are real
+        # trigram statistics; ``pos[1]``/``pos[2]`` are only skip-grams and
+        # cannot answer "what follows *this pair*".
+        self.contexts = {}
+        # Topic conditioning: input token -> {response token: count}.  Without
+        # it a pure Markov chain starts every answer from <bos> and therefore
+        # says the same thing regardless of the question.
+        self.associations = {}
         for special in (UNK, BOS, EOS):
             self.ensure(special, kind="special")
 
@@ -160,10 +176,19 @@ class TokenMemory(object):
         self.total_observations += amount
         return rec
 
-    def observe_sequence(self, tokens, class_bit=None, weight=1):
-        """Record counts plus order-1/2/3 positional relations."""
+    def observe_sequence(self, tokens, class_bit=None, weight=1, anchor=False):
+        """Record counts, order-1/2/3 relations and order-2 contexts.
+
+        ``anchor=True`` wraps the sequence in ``<bos> ... <eos>`` so the model
+        learns how an answer *starts* and *stops*.  Without it the generator
+        has no idea when to shut up -- which is exactly what the first version
+        of this method got wrong.
+        """
         texts = [t.text if hasattr(t, "text") else t for t in tokens]
         kinds = [t.kind if hasattr(t, "kind") else "word" for t in tokens]
+        if anchor:
+            texts = [BOS] + texts + [EOS]
+            kinds = ["special"] + kinds + ["special"]
         for text, kind in zip(texts, kinds):
             self.observe(text, kind, weight, class_bit)
         for index in range(len(texts)):
@@ -180,7 +205,110 @@ class TokenMemory(object):
                 table = source.pos[order - 1]
                 table[target] = table.get(target, 0) + weight
             self._bound_relations(source)
+
+        # Order-2 contexts (true trigrams).
+        for index in range(len(texts) - 2):
+            self.observe_context(texts[index], texts[index + 1],
+                                 texts[index + 2], weight)
         return self
+
+    # -- trigram contexts ----------------------------------------------
+    def observe_context(self, first, second, successor, weight=1):
+        key = context_key((first, second))
+        table = self.contexts.get(key)
+        if table is None:
+            if len(self.contexts) >= self.cfg.max_contexts:
+                self._evict_contexts()
+            table = {}
+            self.contexts[key] = table
+        table[successor] = table.get(successor, 0) + weight
+        limit = self.cfg.max_successors_per_context
+        if len(table) > limit:
+            keep = sorted(table.items(), key=lambda kv: kv[1], reverse=True)[:limit]
+            self.contexts[key] = dict(keep)
+        return self.contexts[key]
+
+    def _evict_contexts(self):
+        """Drop the weakest contexts -- the table is bounded like everything else."""
+        if not self.contexts:
+            return 0
+        scored = sorted(self.contexts.items(),
+                        key=lambda kv: sum(kv[1].values()))
+        batch = max(1, self.cfg.eviction_batch)
+        for key, _ in scored[:batch]:
+            del self.contexts[key]
+        return batch
+
+    def context_successors(self, first, second):
+        return self.contexts.get(context_key((first, second)), {})
+
+    def context_score(self, first, second, candidate):
+        """P(candidate | first, second) in [0, 1]."""
+        table = self.contexts.get(context_key((first, second)))
+        if not table:
+            return 0.0
+        hit = table.get(candidate)
+        if not hit:
+            return 0.0
+        total = 0
+        for value in table.values():
+            total += value
+        return (float(hit) / float(total)) if total > 0 else 0.0
+
+    # -- prompt/response associations ----------------------------------
+    def observe_association(self, input_texts, response_texts, weight=1):
+        """Remember which answer tokens follow which question tokens."""
+        limit = self.cfg.max_associations_per_token
+        unique_response = []
+        seen = set()
+        for text in response_texts:
+            if text not in seen:
+                seen.add(text)
+                unique_response.append(text)
+        for source in set(input_texts):
+            if source in (BOS, EOS, UNK):
+                continue
+            table = self.associations.get(source)
+            if table is None:
+                if len(self.associations) >= self.cfg.max_tokens:
+                    self.associations.pop(next(iter(self.associations)), None)
+                table = {}
+                self.associations[source] = table
+            for target in unique_response:
+                if target in (BOS, UNK):
+                    continue
+                table[target] = table.get(target, 0) + weight
+            if len(table) > limit:
+                keep = sorted(table.items(), key=lambda kv: kv[1],
+                              reverse=True)[:limit]
+                self.associations[source] = dict(keep)
+        return self
+
+    def association_score(self, input_texts, candidate):
+        """Mean P(candidate | question token) over the question, in [0, 1]."""
+        if not input_texts:
+            return 0.0
+        total = 0.0
+        seen = 0
+        for source in set(input_texts):
+            table = self.associations.get(source)
+            if not table:
+                continue
+            hit = table.get(candidate)
+            denominator = 0
+            for value in table.values():
+                denominator += value
+            if denominator > 0:
+                total += float(hit or 0) / float(denominator)
+                seen += 1
+        return (total / float(seen)) if seen else 0.0
+
+    def association_candidates(self, input_texts):
+        out = {}
+        for source in set(input_texts):
+            for target, count in (self.associations.get(source) or {}).items():
+                out[target] = out.get(target, 0) + count
+        return out
 
     def update_error(self, text, observed_error, alpha):
         rec = self.tokens.get(text)
@@ -245,7 +373,8 @@ class TokenMemory(object):
 
     # -- maintenance ---------------------------------------------------
     def compact(self):
-        """Purge relation entries pointing at evicted tokens."""
+        """Purge relation, context and association entries pointing at
+        tokens that have since been evicted."""
         alive = self.tokens
         removed = 0
         for rec in alive.values():
@@ -255,7 +384,33 @@ class TokenMemory(object):
                 for key in dead:
                     del table[key]
                     removed += 1
+        for key in list(self.contexts):
+            parts = key.split(CONTEXT_SEP)
+            if any(part not in alive for part in parts):
+                del self.contexts[key]
+                removed += 1
+                continue
+            table = self.contexts[key]
+            for successor in [k for k in table if k not in alive]:
+                del table[successor]
+                removed += 1
+            if not table:
+                del self.contexts[key]
+        for source in list(self.associations):
+            if source not in alive:
+                del self.associations[source]
+                removed += 1
+                continue
+            table = self.associations[source]
+            for target in [k for k in table if k not in alive]:
+                del table[target]
+                removed += 1
+            if not table:
+                del self.associations[source]
         return removed
+
+    def total_contexts(self):
+        return len(self.contexts)
 
     # -- serialisation -------------------------------------------------
     def to_dict(self, compact=False):
@@ -279,6 +434,8 @@ class TokenMemory(object):
             tokens[text] = entry
         return {
             "tokens": tokens,
+            "contexts": self.contexts,
+            "associations": self.associations,
             "next_id": self._next_id,
             "free_ids": sorted(self._free_ids),
             "clock": self._clock,
@@ -303,6 +460,10 @@ class TokenMemory(object):
             rec.error_ema = float(entry.get("e", 0.5))
             rec.last_used = int(entry.get("u", 0))
             memory.tokens[text] = rec
+        memory.contexts = dict(
+            (key, dict(value)) for key, value in (data.get("contexts") or {}).items())
+        memory.associations = dict(
+            (key, dict(value)) for key, value in (data.get("associations") or {}).items())
         memory._next_id = int(data.get("next_id", len(memory.tokens)))
         memory._free_ids = list(data.get("free_ids") or [])
         memory._clock = int(data.get("clock", 0))

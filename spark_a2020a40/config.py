@@ -44,6 +44,10 @@ class Config(object):
         "backup_suffix", "compact_mode", "eviction_batch",
         # --- tokenizer --------------------------------------------------
         "max_token_chars", "casefold",
+        # --- markov ------------------------------------------------------
+        "markov_order", "backoff_alpha", "max_contexts",
+        "max_successors_per_context", "max_associations_per_token",
+        "w_markov", "w_assoc", "w_expert", "markov_floor", "assoc_gain",
         # --- features ---------------------------------------------------
         "context_window", "normalizer_warmup", "clip_sigma",
         # --- neuron -----------------------------------------------------
@@ -89,6 +93,18 @@ class Config(object):
         # tokenizer ------------------------------------------------------
         self.max_token_chars = _env("MAX_TOKEN_CHARS", 32, int)
         self.casefold = _env("CASEFOLD", True, bool)
+
+        # markov ---------------------------------------------------------
+        self.markov_order = _env("MARKOV_ORDER", 3, int)
+        self.backoff_alpha = _env("BACKOFF_ALPHA", 0.4, float)
+        self.max_contexts = _env("MAX_CONTEXTS", 800 if tiny else 12000, int)
+        self.max_successors_per_context = _env("MAX_SUCCESSORS", 6 if tiny else 24, int)
+        self.max_associations_per_token = _env("MAX_ASSOCIATIONS", 10 if tiny else 40, int)
+        self.w_markov = _env("W_MARKOV", 1.0, float)
+        self.w_assoc = _env("W_ASSOC", 3.0, float)
+        self.w_expert = _env("W_EXPERT", 0.8, float)
+        self.markov_floor = _env("MARKOV_FLOOR", 1e-6, float)
+        self.assoc_gain = _env("ASSOC_GAIN", 20.0, float)
 
         # features -------------------------------------------------------
         self.context_window = _env("CONTEXT_WINDOW", 12 if tiny else 32, int)
@@ -142,7 +158,7 @@ class Config(object):
         # generation -----------------------------------------------------
         self.max_generated_tokens = _env("MAX_GEN", 20 if tiny else 48, int)
         self.max_candidates = _env("MAX_CANDIDATES", 16 if tiny else 48, int)
-        self.temperature = _env("TEMPERATURE", 0.7, float)
+        self.temperature = _env("TEMPERATURE", 0.1, float)
         self.repetition_window = _env("REPETITION_WINDOW", 8, int)
 
         # teacher --------------------------------------------------------
@@ -179,6 +195,10 @@ class Config(object):
             raise ConfigError("error_ema_alpha must be in (0,1)")
         if self.lambda_q < 0.0:
             raise ConfigError("lambda_q must be >= 0")
+        if not (0.0 < self.backoff_alpha < 1.0):
+            raise ConfigError("backoff_alpha must be in (0,1)")
+        if self.markov_order < 1 or self.markov_order > 3:
+            raise ConfigError("markov_order must be 1, 2 or 3")
         return self
 
     def id_capacity(self):

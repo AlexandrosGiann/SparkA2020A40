@@ -10,6 +10,7 @@ import random
 from .adaptive_neuron import AdaptiveQuadraticNeuron, softmax
 from .experts import ExpertPool
 from .features import FeatureExtractor, N_FEATURES, N_INPUT_FEATURES
+from .markov import MarkovScorer
 from .memory import TokenMemory
 from .router import Router
 from .tokenizer import BOS, EOS, UNK, Tokenizer
@@ -20,13 +21,14 @@ class StudentModel(object):
 
     __slots__ = ("cfg", "tokenizer", "memory", "features", "pool", "router",
                  "class_predictor", "previous_predicted_class_bit",
-                 "step", "_rng", "generations")
+                 "step", "_rng", "generations", "markov")
 
     def __init__(self, cfg, memory=None):
         self.cfg = cfg
         self.tokenizer = Tokenizer(cfg.casefold, cfg.max_token_chars)
         self.memory = memory if memory is not None else TokenMemory(cfg)
         self.features = FeatureExtractor(cfg, self.memory)
+        self.markov = MarkovScorer(cfg, self.memory)
         self.pool = ExpertPool(cfg, N_FEATURES, initial=max(1, cfg.min_experts))
         self.router = Router(cfg, N_INPUT_FEATURES, self.pool.ids())
         self.class_predictor = AdaptiveQuadraticNeuron(
@@ -80,43 +82,13 @@ class StudentModel(object):
     # candidate generation and scoring
     # ==================================================================
     def candidate_tokens(self, input_texts, output_texts):
-        """A bounded candidate set -- we never score the whole vocabulary."""
-        limit = self.cfg.max_candidates
-        scored = {}
+        """A bounded candidate set driven by the n-gram evidence.
 
-        def offer(token, weight):
-            if token in (BOS, UNK):
-                return
-            scored[token] = scored.get(token, 0.0) + weight
-
-        previous = output_texts[-1] if output_texts else (
-            input_texts[-1] if input_texts else None)
-        if previous is not None:
-            for token, count in self.memory.successors(previous, 1).items():
-                offer(token, 3.0 * count)
-        if len(output_texts) >= 2:
-            for token, count in self.memory.successors(output_texts[-2], 2).items():
-                offer(token, 1.5 * count)
-        if len(output_texts) >= 3:
-            for token, count in self.memory.successors(output_texts[-3], 3).items():
-                offer(token, 1.0 * count)
-        for text in input_texts:
-            for token, count in self.memory.successors(text, 1).items():
-                offer(token, 1.0 * count)
-        if len(scored) < limit:
-            # Back off to the globally most common tokens.
-            common = sorted(self.memory.tokens.items(),
-                            key=lambda kv: -kv[1].count)
-            for text, record in common:
-                if len(scored) >= limit:
-                    break
-                if record.kind == "special" and text != EOS:
-                    continue
-                offer(text, 0.1 * self.memory.commonality(text))
-        offer(EOS, 0.5)
-
-        ordered = sorted(scored.items(), key=lambda kv: (-kv[1], kv[0]))
-        return [token for token, _ in ordered[:limit]]
+        Delegated to :class:`MarkovScorer` so that generation and distillation
+        always see the same candidates.
+        """
+        return self.markov.candidates(input_texts, output_texts,
+                                      self.cfg.max_candidates)
 
     def route(self, input_features):
         """Pick the Top-k experts for this context (never the whole pool)."""
@@ -127,11 +99,24 @@ class StudentModel(object):
     def score_candidates(self, candidates, experts, input_texts, output_texts,
                          input_class_bit, learn_norm=True):
         """Return ``(scores, feature_vectors, confidences)`` aligned with
-        ``candidates``."""
+        ``candidates``.
+
+        The score is a log-linear blend:
+
+            w_markov · log S(token | w₋₂ w₋₁)      -- word order
+          + w_assoc  · log(1 + gain·P(token | question))  -- topic (a bonus)
+          + w_expert · expert_correction           -- learned re-ranking
+
+        The Markov term is the backbone. The experts only *correct* it, which
+        is why a freshly initialised pool no longer produces word salad: with
+        zero-weight experts the blend degrades gracefully to a plain trigram
+        model instead of to noise.
+        """
+        cfg = self.cfg
         scores = []
         vectors = []
         confidences = []
-        recent = output_texts[-self.cfg.repetition_window:] if output_texts else []
+        recent = output_texts[-cfg.repetition_window:] if output_texts else []
         for candidate in candidates:
             vector = self.features.build_token_features(
                 candidate,
@@ -142,22 +127,30 @@ class StudentModel(object):
                 learn=learn_norm,
             )
             vectors.append(vector)
+
+            total = cfg.w_markov * self.markov.log_score(candidate, output_texts)
+            total += cfg.w_assoc * self.markov.association_bonus(
+                candidate, input_texts)
+
             if experts:
-                total = 0.0
+                correction = 0.0
                 confidence = 0.0
                 for expert in experts:
-                    total += expert.score(vector)
+                    # Squashed to [-1, 1] so an unbounded logit cannot drown
+                    # the language model.
+                    correction += 2.0 * (expert.predict_proba(vector) - 0.5)
                     confidence += expert.confidence(vector)
-                total /= float(len(experts))
-                confidence /= float(len(experts))
+                count = float(len(experts))
+                total += cfg.w_expert * (correction / count)
+                confidence /= count
             else:
-                total = 0.0
                 confidence = 0.0
-            # Repetition is discouraged in the score, not by a hard ban, so the
-            # model can still repeat a token when the evidence is strong.
+
+            # Repetition is discouraged in the score, not by a hard ban.
             repeats = recent.count(candidate)
             if repeats:
-                total -= 1.25 * repeats
+                total -= 2.0 * repeats
+
             scores.append(total)
             confidences.append(confidence)
         return scores, vectors, confidences
@@ -182,6 +175,7 @@ class StudentModel(object):
         output_texts = []
         confidences = []
         used_features = []
+        finished = False
         for _ in range(max_tokens):
             candidates = self.candidate_tokens(input_texts, output_texts)
             if not candidates:
@@ -194,6 +188,7 @@ class StudentModel(object):
             confidences.append(step_confidences[index])
             used_features.append(vectors[index])
             if token == EOS:
+                finished = True
                 break
             output_texts.append(token)
 
@@ -219,6 +214,7 @@ class StudentModel(object):
             "confidences": confidences,
             "features": used_features,
             "empty": not bool(output_texts),
+            "finished": finished,
         }
 
     def _choose(self, scores, greedy):

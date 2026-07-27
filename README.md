@@ -7,7 +7,8 @@ student runtime is pure Python standard library.
 The project is named after the **Lenovo A2020a40** (Android 5.1.1, 1 GB RAM,
 8 GB storage), the long-term compatibility target.
 
-> v2.0.0 is a full rewrite of the internals. The old flat `spark_a2020a40.py`
+> v2.1.0 adds a backoff Markov backbone to generation -- see
+> [CHANGELOG.md](CHANGELOG.md). v2.0.0 was a full rewrite of the internals. The old flat `spark_a2020a40.py`
 > still works as an entry point and the old `bittreelm_memory.json` migrates
 > automatically. See [CHANGELOG.md](CHANGELOG.md).
 
@@ -42,6 +43,34 @@ consults only the right one or two per context.
 
 The **teacher** is an Ollama model on a laptop. The **student** is everything
 above and keeps working when the laptop is off.
+
+### Generation: Markov backbone, experts as re-ranker
+
+Experts are good at *judging* a token but hopeless at *ordering* one — ordering
+is a property of the corpus, not of a classifier with near-zero initial
+weights. So the score is a log-linear blend in which the n-gram statistics do
+the heavy lifting:
+
+```
+score(token) = w_markov · log S(token | w₋₂ w₋₁)            word order
+             + w_assoc  · log(1 + gain · P(token | question))  topic
+             + w_expert · expert_correction ∈ [-1, 1]          learned re-ranking
+             - repetition penalty
+```
+
+`S` is **stupid backoff** (trigram → bigram → unigram, α = 0.4). With a freshly
+initialised expert pool the blend degrades to a plain trigram model rather than
+to noise.
+
+Two details that matter more than they look:
+
+* **Answers are anchored as `<bos> … <eos>`.** Without this the model never
+  learns how a reply starts or stops. In v2.0 it learned neither, so replies
+  began mid-sentence and ran until the token cap.
+* **The topic term is a bonus, not a log-probability.** As a log-probability it
+  punished every token the question had never co-occurred with — including
+  `<eos>`, which by construction never appears in an association table. The
+  result was answers that *could not end*.
 
 ### The adaptive quadratic scorer
 
@@ -377,15 +406,29 @@ python3 benchmark.py --turns 120 --both
 
 Measured on x86-64 Python 3.10 (a 2015 phone will be roughly 10–20× slower):
 
-| metric | tiny_android | desktop_training |
+| metric | v2.0 (no Markov) | v2.1 (Markov backbone) |
 |---|---|---|
-| training turn (mean / p95) | 22.1 / 41.5 ms | 101.1 / 223.1 ms |
-| inference only (mean / p95) | 9.5 / 19.6 ms | 83.2 / 219.3 ms |
-| peak RSS | 20.7 MB | 24.1 MB |
-| active experts | 1 / 6 | 1 / 24 |
+| training turn (mean / p95) | 22.1 / 41.5 ms | 20.4 / 31.5 ms |
+| inference only (mean / p95) | 9.5 / 19.6 ms | 10.6 / 13.5 ms |
+| peak RSS | 20.7 MB | 20.9 MB |
+| **teacher agreement** (1st → 2nd half) | 0.345 → 0.408 | **1.0 → 1.0** |
+| **mean reward** | +0.55 | **+0.99** |
 | class accuracy | 0.975 | 0.975 |
-| teacher agreement (1st → 2nd half) | 0.345 → 0.408 | 0.407 → 0.382 |
-| memory JSON | 9.0 KB | 115.5 KB |
+| memory JSON | 9.0 KB | 13.5 KB |
+
+The extra 4.5 KB buys the trigram context table and the question/answer
+associations. Latency is unchanged: the Markov lookup replaces work the
+expert used to do, it does not add to it.
+
+### What this does and does not buy you
+
+After sixty turns on three lessons, greedy decoding reproduces each taught
+answer verbatim and stops on its own. An unseen question still yields a clean,
+grammatical sentence — the closest thing it knows — rather than word salad.
+
+It is still an n-gram model. It has no topic, no intent and no memory of the
+conversation beyond the last two tokens. It recombines phrases it has been
+taught; it does not understand them. Expect fluency, not comprehension.
 
 Peak memory comes from `resource.getrusage` on Linux/Android and falls back to
 `tracemalloc` elsewhere; the report always labels the source.
@@ -435,7 +478,8 @@ spark_a2020a40/
     config.py          profiles, env overrides, validation
     tokenizer.py       Unicode Greek/Latin/code tokenizer
     features.py        18 token features + 10 input features, normalisation
-    memory.py          bounded LRU symbolic memory, order-1/2/3 statistics
+    memory.py          bounded LRU memory, order-1/2/3 stats, trigram contexts
+    markov.py          stupid-backoff n-gram scoring + topic conditioning
     adaptive_neuron.py z = Σw·f + Σq·f² + b, proximal-L1 curvature
     experts.py         Expert, ExpertPool, should_retrain
     router.py          contextual bandit, Top-k selection
@@ -462,6 +506,7 @@ ollama_client.py       deprecated wrapper over teacher.py
 | | |
 |---|---|
 | Greek + English tokenizer | working |
+| Markov backbone generation | working |
 | student offline | working |
 | teacher via Ollama | working |
 | selective retraining + rollback | working |
