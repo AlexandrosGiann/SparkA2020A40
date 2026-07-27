@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+spark_memory.json
+spark_memory.json.bak
+bench_*.json

@@ -1,37 +1,37 @@
-import urllib.request
-import json
+# -*- coding: utf-8 -*-
+"""Deprecated standalone Ollama helper -- use ``spark_a2020a40.teacher``.
+
+The original version of this file had an empty ``IP_ADDRESS``, ran ``input()``
+twice at import time and printed the answer to stdout as a side effect of being
+imported.  It is kept as a thin, importable wrapper so existing scripts do not
+break; it no longer does anything on import.
+"""
+
+import sys
+
+from spark_a2020a40.config import Config
+from spark_a2020a40.teacher import TeacherClient
 
 
-def generate_text(prompt, model="samantha-mistral"):
-    IP_ADDRESS = ""
-    url = f"http://{IP_ADDRESS}:11434/api/generate"
-
-    data = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False
-    }
-
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(data).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": "OldAndroidPython/1.0"
-        },
-        method="POST"
-    )
-
-    try:
-        response = urllib.request.urlopen(req, timeout=60)
-        result = json.loads(response.read().decode("utf-8", errors="ignore"))
-        return result.get("response", "")
-    except Exception as e:
-        print("Request failed:", e)
-        return None
+def generate_text(prompt, model=None, host=None, port=None, timeout=None):
+    """Return the teacher's answer, or ``None`` when Ollama is unreachable."""
+    cfg = Config()
+    if host:
+        cfg.ollama_host = host
+    if port:
+        cfg.ollama_port = int(port)
+    if model:
+        cfg.ollama_model = model
+    return TeacherClient(cfg).generate(prompt, timeout=timeout)
 
 
-prompt = input("Write something: ")
-print(generate_text(prompt))
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    prompt = " ".join(argv) if argv else input("Write something: ")
+    answer = generate_text(prompt)
+    print(answer if answer is not None else "(teacher unavailable)")
+    return 0 if answer is not None else 1
 
-print(generate_text(input("Write something:")))
+
+if __name__ == "__main__":
+    sys.exit(main())
