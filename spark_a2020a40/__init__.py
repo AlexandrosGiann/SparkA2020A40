@@ -10,7 +10,7 @@ f-strings and dataclasses so that it stays parsable by the older Python 3
 interpreters shipped with QPython 3H / Pydroid.
 """
 
-__version__ = "2.1.0"
+__version__ = "2.2.1"
 __author__ = "Alexandros Giannakis"
 
 SCHEMA_VERSION = 3

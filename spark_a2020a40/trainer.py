@@ -18,7 +18,8 @@ from .experts import should_retrain
 from .features import N_FEATURES
 from .rewards import RewardEngine
 from .teacher import TeacherClient
-from .tokenizer import EOS
+from .tokenizer import (EOS, LANGUAGE_NAMES, LANG_LATIN, keep_language,
+                        text_language)
 
 NEGATIVES_PER_POSITIVE = 3
 
@@ -143,14 +144,34 @@ class TrainingCoordinator(object):
 
         # 4-6. teacher --------------------------------------------------
         teacher_texts = []
+        input_language = text_language(input_tokens, default=LANG_LATIN)
+        report["language"] = input_language
         if teacher_text is None and use_teacher and self.teacher.is_available():
-            teacher_text = self.teacher.generate(user_input)
+            teacher_text = self.teacher.generate(
+                user_input, system=self.system_prompt(input_language))
         report["teacher_available"] = teacher_text is not None
         report["teacher_text"] = teacher_text
+        # The user's own words are real language data and are always worth
+        # recording, teacher or not.  They are deliberately *not* anchored:
+        # observing them enriches the n-gram tables without ever making them
+        # answer-starters, so the student learns from them without parroting
+        # the question back.
+        student.memory.observe_sequence(input_tokens, class_bit=target_class)
+
+        if teacher_text and cfg.match_language:
+            # Strip foreign-language asides *before* they reach the memory.
+            # Fixing this at generation time instead means fighting the n-gram
+            # evidence mid-phrase, which pushes the chain off its path and
+            # produces loops -- measurably worse than not fixing it at all.
+            cleaned = keep_language(teacher_text, input_language, student.tokenizer)
+            if cleaned != teacher_text:
+                report["teacher_text_cleaned"] = cleaned
+            teacher_text = cleaned
+            report["teacher_text"] = teacher_text
+
         if teacher_text:
             teacher_tokens = student.tokenizer.tokenize_typed(teacher_text)
             teacher_texts = [t.text for t in teacher_tokens]
-            student.memory.observe_sequence(input_tokens, class_bit=target_class)
             # anchor=True wraps the answer in <bos>...<eos>, which is what
             # teaches the generator where an answer starts and stops.
             student.memory.observe_sequence(teacher_tokens, class_bit=target_class,
@@ -238,6 +259,22 @@ class TrainingCoordinator(object):
 
         self.last_turn = report
         return report
+
+    def system_prompt(self, language):
+        """Pin the teacher to the language of the question.
+
+        A multilingual teacher such as aya-expanse otherwise volunteers a
+        parenthetical translation, and every one of those foreign tokens ends
+        up in the student's n-gram tables.
+        """
+        template = self.cfg.teacher_system
+        if not template:
+            return None
+        name = LANGUAGE_NAMES.get(language, "the language of the question")
+        try:
+            return template.format(language=name)
+        except (KeyError, IndexError):
+            return template
 
     # ==================================================================
     # lifecycle + feedback

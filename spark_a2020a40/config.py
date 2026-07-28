@@ -48,6 +48,8 @@ class Config(object):
         "markov_order", "backoff_alpha", "max_contexts",
         "max_successors_per_context", "max_associations_per_token",
         "w_markov", "w_assoc", "w_expert", "markov_floor", "assoc_gain",
+        "eos_pressure", "w_language", "match_language", "teacher_system",
+        "no_repeat_ngram", "w_no_repeat", "min_continuation_evidence",
         # --- features ---------------------------------------------------
         "context_window", "normalizer_warmup", "clip_sigma",
         # --- neuron -----------------------------------------------------
@@ -105,6 +107,37 @@ class Config(object):
         self.w_expert = _env("W_EXPERT", 0.8, float)
         self.markov_floor = _env("MARKOV_FLOOR", 1e-6, float)
         self.assoc_gain = _env("ASSOC_GAIN", 20.0, float)
+        self.eos_pressure = _env("EOS_PRESSURE", 20.0, float)
+        # Standard no-repeat-ngram decoding constraint.  The plain repetition
+        # window only sees the last few tokens, so a Markov cycle longer than
+        # the window (a repeated *phrase*) slips straight past it.
+        self.no_repeat_ngram = _env("NO_REPEAT_NGRAM", 3, int)
+        self.w_no_repeat = _env("W_NO_REPEAT", 25.0, float)
+        # "If I have nothing solid to say next, stop."  Once the chosen
+        # continuation is only supported by a backed-off unigram, the model has
+        # run out of learned material; carrying on just emits plausible-looking
+        # debris.  Stupid-backoff scores a real bigram/trigram well above this.
+        self.min_continuation_evidence = _env("MIN_EVIDENCE", 0.02, float)
+        # Answer in the language of the question.  Two independent levers:
+        #
+        #   match_language -- strip foreign-language asides from the teacher's
+        #       reply *before* it reaches the memory.  This is the one that
+        #       works: measured on a bilingual corpus it takes language purity
+        #       from 70% to 100% with no loops.
+        #   w_language -- penalise off-language candidates during generation.
+        #       Measured at 85% purity, but it fights the n-gram evidence
+        #       mid-phrase and caused loops (average answer 23 tokens instead
+        #       of 7).  Off by default; raise it only to clean up a memory that
+        #       was already polluted before match_language existed.
+        self.match_language = _env("MATCH_LANGUAGE", True, bool)
+        self.w_language = _env("W_LANGUAGE", 0.0, float)
+        self.teacher_system = _env(
+            "TEACHER_SYSTEM",
+            "You are a concise assistant. Reply ONLY in {language}. "
+            "Give the answer itself and nothing else: no translations, no "
+            "parenthetical glosses, no definitions or explanations of your own "
+            "words, no notes about what language you are using. "
+            "Answer in one or two short sentences.", str)
 
         # features -------------------------------------------------------
         self.context_window = _env("CONTEXT_WINDOW", 12 if tiny else 32, int)
@@ -156,15 +189,15 @@ class Config(object):
         self.w_uncertainty = _env("W_UNCERTAINTY", 0.2, float)
 
         # generation -----------------------------------------------------
-        self.max_generated_tokens = _env("MAX_GEN", 20 if tiny else 48, int)
+        self.max_generated_tokens = _env("MAX_GEN", 40 if tiny else 96, int)
         self.max_candidates = _env("MAX_CANDIDATES", 16 if tiny else 48, int)
         self.temperature = _env("TEMPERATURE", 0.1, float)
         self.repetition_window = _env("REPETITION_WINDOW", 8, int)
 
         # teacher --------------------------------------------------------
-        self.ollama_host = _env("OLLAMA_HOST", "127.0.0.1", str)
+        self.ollama_host = _env("OLLAMA_HOST", "192.168.1.29", str)
         self.ollama_port = _env("OLLAMA_PORT", 11434, int)
-        self.ollama_model = _env("OLLAMA_MODEL", "tinyllama", str)
+        self.ollama_model = _env("OLLAMA_MODEL", "aya-expanse:8b", str)
         self.teacher_timeout = _env("TEACHER_TIMEOUT", 60.0, float)
         self.teacher_probe_timeout = _env("TEACHER_PROBE_TIMEOUT", 1.5, float)
         self.teacher_recheck_seconds = _env("TEACHER_RECHECK", 30.0, float)

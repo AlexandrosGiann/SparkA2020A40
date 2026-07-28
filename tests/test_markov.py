@@ -277,5 +277,121 @@ class TestGenerationQuality(unittest.TestCase):
         self.assertEqual(best, "γεια")
 
 
+class TestLoopPrevention(unittest.TestCase):
+    """A Markov chain can re-enter a phrase it already emitted and cycle."""
+
+    # The teacher replies that actually triggered this in the field.
+    LOOPERS = [
+        ("Γεια σου",
+         'Γεια σου!(Χαιρετισμός σε ελληνική γλώσσα που σημαίνει "Γεια σας")'),
+        ("How are you?",
+         "I'm an artificial intelligence, so I don't have feelings or a state "
+         "of being. However, I'm here and ready to assist you."),
+    ]
+
+    def setUp(self):
+        self.cfg = Config()
+        self.student = StudentModel(self.cfg)
+        coordinator = TrainingCoordinator(
+            self.cfg, self.student, OfflineTeacher(self.cfg))
+        for prompt, answer in self.LOOPERS:
+            coordinator.process_turn(prompt, teacher_text=answer)
+
+    @staticmethod
+    def repeated_ngram(tokens, size=3):
+        grams = [tuple(tokens[i:i + size]) for i in range(len(tokens) - size + 1)]
+        return any(grams.count(g) > 1 for g in grams)
+
+    def test_emitted_ngrams(self):
+        self.assertEqual(StudentModel.emitted_ngrams(["a", "b", "c", "d"], 3),
+                         {("a", "b", "c"), ("b", "c", "d")})
+        self.assertEqual(StudentModel.emitted_ngrams(["a"], 3), set())
+
+    def test_no_phrase_is_repeated(self):
+        for prompt, _ in self.LOOPERS:
+            tokens = self.student.generate(prompt, greedy=True)["tokens"]
+            self.assertFalse(self.repeated_ngram(tokens),
+                             "{0} -> {1}".format(prompt, tokens))
+
+    def test_generation_stops_well_before_the_cap(self):
+        for prompt, _ in self.LOOPERS:
+            result = self.student.generate(prompt, greedy=True)
+            self.assertTrue(result["finished"])
+            self.assertLess(len(result["tokens"]),
+                            self.cfg.max_generated_tokens)
+
+    def test_answers_end_on_a_sentence_boundary(self):
+        for prompt, _ in self.LOOPERS:
+            tokens = self.student.generate(prompt, greedy=True)["tokens"]
+            self.assertIn(tokens[-1], StudentModel.SENTENCE_END,
+                          "{0} -> {1}".format(prompt, tokens))
+
+    def test_trim_keeps_a_complete_sentence(self):
+        trimmed = self.student._trim_to_sentence(
+            ["a", "b", ".", "c", "d"])
+        self.assertEqual(trimmed, ["a", "b", "."])
+
+    def test_trim_is_a_no_op_without_a_boundary(self):
+        self.assertEqual(self.student._trim_to_sentence(["a", "b"]), ["a", "b"])
+
+    def test_debris_detects_a_repeated_ngram(self):
+        output = ["a", "b", "c"]
+        seen = StudentModel.emitted_ngrams(["a", "b", "c"], 3)
+        self.assertTrue(self.student._is_debris("c", ["a", "b"], seen))
+
+    def test_a_well_supported_continuation_is_not_debris(self):
+        prompt, answer = self.LOOPERS[1]
+        tokens = self.student.tokenizer.tokenize(answer)
+        self.assertFalse(
+            self.student._is_debris(tokens[1], tokens[:1], set()))
+
+    def test_disabling_the_constraint_brings_the_loop_back(self):
+        """Documents what the constraint is actually buying."""
+        cfg = Config()
+        cfg.no_repeat_ngram = 0
+        cfg.min_continuation_evidence = 0.0
+        student = StudentModel(cfg)
+        coordinator = TrainingCoordinator(cfg, student, OfflineTeacher(cfg))
+        for prompt, answer in self.LOOPERS:
+            coordinator.process_turn(prompt, teacher_text=answer)
+        looped = any(
+            self.repeated_ngram(student.generate(p, greedy=True)["tokens"])
+            for p, _ in self.LOOPERS)
+        self.assertTrue(looped)
+
+
+class TestOfflineLearning(unittest.TestCase):
+    """With no teacher the student must still learn, and still stop talking."""
+
+    def setUp(self):
+        self.cfg = Config()
+        self.student = StudentModel(self.cfg)
+        self.coordinator = TrainingCoordinator(
+            self.cfg, self.student, OfflineTeacher(self.cfg))
+
+    def test_user_input_is_recorded_without_a_teacher(self):
+        before = len(self.student.memory)
+        self.coordinator.process_turn("γεια σου τι κάνεις σήμερα")
+        self.assertGreater(len(self.student.memory), before)
+
+    def test_questions_are_not_anchored_as_answers(self):
+        """Input must not teach the model to start replies with the question."""
+        self.coordinator.process_turn("γεια σου τι κάνεις")
+        self.assertEqual(self.student.memory.get(EOS).count, 0)
+        self.assertEqual(self.student.memory.successors(BOS, 1), {})
+
+    def test_it_stops_even_without_stop_evidence(self):
+        for _ in range(5):
+            self.coordinator.process_turn("γεια σου τι κάνεις σήμερα φίλε μου")
+        self.assertFalse(self.student._has_stop_evidence())
+        result = self.student.generate("γεια σου", greedy=True)
+        self.assertTrue(result["finished"], result["tokens"])
+        self.assertLess(len(result["tokens"]), self.cfg.max_generated_tokens)
+
+    def test_stop_evidence_is_trusted_once_it_exists(self):
+        self.coordinator.process_turn("γεια", teacher_text="γεια σου φίλε")
+        self.assertTrue(self.student._has_stop_evidence())
+
+
 if __name__ == "__main__":
     unittest.main()

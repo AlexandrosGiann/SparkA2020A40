@@ -56,6 +56,159 @@ def normalize_text(text, casefold=True):
     return text
 
 
+#: Greek letters, used to decide where a final sigma is required.
+_GREEK_RANGES = ((0x0370, 0x03FF), (0x1F00, 0x1FFF))
+
+
+def _is_greek(ch):
+    code = ord(ch)
+    for low, high in _GREEK_RANGES:
+        if low <= code <= high:
+            return True
+    return False
+
+
+def restore_final_sigma(text):
+    """Render a casefolded Greek token with correct orthography.
+
+    ``casefold()`` maps ``ς`` to ``σ`` so that "λόγος" and "λόγοσ" share one
+    memory key -- correct for matching, wrong for display: the user sees "πώσ"
+    and "ωσ".  In Greek a word-final sigma is *always* written ``ς``, so the
+    surface form can be restored deterministically at render time without
+    storing a second copy of every token.
+    """
+    if not text or "σ" not in text:
+        return text
+    characters = list(text)
+    last = len(characters) - 1
+    for index, ch in enumerate(characters):
+        if ch != "σ":
+            continue
+        following = characters[index + 1] if index < last else ""
+        # Final position, or followed by anything that is not a Greek letter.
+        if not following or not _is_greek(following):
+            # ... but only inside a Greek word.
+            previous = characters[index - 1] if index > 0 else ""
+            if previous and _is_greek(previous):
+                characters[index] = "ς"
+    return "".join(characters)
+
+
+LANG_GREEK = "el"
+LANG_LATIN = "en"
+LANG_NEUTRAL = ""
+
+#: Latin ranges we care about (ASCII + Latin-1/Extended letters).
+_LATIN_RANGES = ((0x0041, 0x005A), (0x0061, 0x007A), (0x00C0, 0x024F))
+
+
+def _is_latin(ch):
+    code = ord(ch)
+    for low, high in _LATIN_RANGES:
+        if low <= code <= high:
+            return True
+    return False
+
+
+def token_language(text):
+    """``LANG_GREEK``, ``LANG_LATIN`` or ``LANG_NEUTRAL`` for one token.
+
+    Numbers, punctuation, operators and URLs are neutral: they belong to every
+    language and must never be penalised by the language filter.
+    """
+    if not text or text in SPECIAL_TOKENS:
+        return LANG_NEUTRAL
+    greek = latin = 0
+    for ch in text:
+        if _is_greek(ch):
+            greek += 1
+        elif _is_latin(ch):
+            latin += 1
+    if greek > latin:
+        return LANG_GREEK
+    if latin > greek:
+        return LANG_LATIN
+    return LANG_NEUTRAL
+
+
+def text_language(tokens, default=LANG_NEUTRAL):
+    """Majority language of a token sequence, ignoring neutral tokens."""
+    greek = latin = 0
+    for token in tokens or ():
+        text = token.text if hasattr(token, "text") else token
+        language = token_language(text)
+        if language == LANG_GREEK:
+            greek += 1
+        elif language == LANG_LATIN:
+            latin += 1
+    if greek > latin:
+        return LANG_GREEK
+    if latin > greek:
+        return LANG_LATIN
+    return default
+
+
+LANGUAGE_NAMES = {LANG_GREEK: "Greek", LANG_LATIN: "English"}
+
+#: Segment boundaries used when stripping foreign-language asides.
+_SEGMENT_OPEN = "([{"
+_SEGMENT_CLOSE = ")]}"
+_SEGMENT_END = ".!?;·\n"
+
+
+def split_segments(text):
+    """Split text into parenthetical and sentence-level segments.
+
+    Multilingual teachers love to append "(Hello! How can I assist you?)" to a
+    Greek answer.  Splitting on brackets and sentence ends is enough to isolate
+    those asides so they can be dropped before they poison the n-gram tables.
+    """
+    segments = []
+    current = []
+    depth = 0
+    for ch in text or "":
+        if ch in _SEGMENT_OPEN:
+            if current:
+                segments.append("".join(current))
+                current = []
+            depth += 1
+            current.append(ch)
+            continue
+        current.append(ch)
+        if ch in _SEGMENT_CLOSE and depth > 0:
+            depth -= 1
+            segments.append("".join(current))
+            current = []
+            continue
+        if depth == 0 and ch in _SEGMENT_END:
+            segments.append("".join(current))
+            current = []
+    if current:
+        segments.append("".join(current))
+    return [seg for seg in segments if seg.strip()]
+
+
+def keep_language(text, language, tokenizer=None):
+    """Drop the segments of ``text`` written in a different language.
+
+    Returns the surviving text.  If nothing survives (for example the teacher
+    ignored the instruction entirely) the original text is returned unchanged
+    -- silently learning nothing would be worse than learning the wrong
+    language.
+    """
+    if not language or not text:
+        return text
+    tok = tokenizer or _DEFAULT
+    kept = []
+    for segment in split_segments(text):
+        segment_language = text_language(tok.tokenize(segment))
+        if segment_language and segment_language != language:
+            continue
+        kept.append(segment)
+    result = "".join(kept).strip()
+    return result if result else text
+
+
 def _is_letter(ch):
     return unicodedata.category(ch)[0] in ("L", "M")
 
@@ -138,8 +291,12 @@ class Tokenizer(object):
             i += 1
         return out
 
-    def detokenize(self, tokens):
-        """Best-effort inverse -- used when printing student output."""
+    def detokenize(self, tokens, restore_sigma=True):
+        """Best-effort inverse -- used when printing student output.
+
+        ``restore_sigma`` fixes the word-final sigma that ``casefold()``
+        flattened, so the output reads "πώς" rather than "πώσ".
+        """
         parts = []
         no_space_before = set(".,;:!?)]}·…%")
         no_space_after = set("([{")
@@ -147,6 +304,8 @@ class Tokenizer(object):
             text = tok.text if isinstance(tok, Token) else tok
             if text in SPECIAL_TOKENS:
                 continue
+            if restore_sigma:
+                text = restore_final_sigma(text)
             if not parts:
                 parts.append(text)
             elif text and text[0] in no_space_before:

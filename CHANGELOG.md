@@ -1,5 +1,183 @@
 # Changelog
 
+## 2.2.1 — no more loops
+
+Once the teacher started answering properly, a different failure showed up in
+both languages: the chain re-entered a phrase it had already produced and
+cycled until the token cap.
+
+    γεια σου! (χαιρετισμός σε ελληνική γλώσσα που σημαίνει " γεια σου!
+    (χαιρετισμός σε ελληνική γλώσσα που σημαίνει " γεια σου!
+
+    i'm an artificial intelligence, so i don't have feelings or a state of
+    being. however, i'm an artificial intelligence, so i don't have feelings
+
+The repetition penalty could not see it: the cycles were 12-14 tokens long and
+`repetition_window` is 8, so no individual token ever looked like a repeat.
+
+### Added
+
+* **`no_repeat_ngram`** (default 3) -- the standard decoding constraint. A
+  candidate that would recreate an already-emitted trigram is penalised by
+  `w_no_repeat`, so a repeated *phrase* is caught however long the cycle is.
+* **`min_continuation_evidence`** (default 0.02) -- "if I have nothing solid to
+  say next, stop". When the best continuation is supported only by a
+  backed-off unigram, the learned material is exhausted and carrying on just
+  emits plausible-looking debris.
+* **Sentence-boundary trimming.** When generation is cut short by either of the
+  above, the trailing incomplete clause is dropped so the answer ends on `.`,
+  `!`, `?` or `;` instead of mid-phrase.
+
+### Changed
+
+* The teacher system prompt now also forbids glosses, definitions and notes
+  about which language is being used -- aya-expanse obeyed "reply in Greek"
+  and then appended a Greek *explanation* of the Greek greeting.
+
+### Effect
+
+| question | before | after |
+|---|---|---|
+| Γεια σου | 20 tokens, phrase repeated twice | `γεια σου!` |
+| How are you? | 20 tokens, cut mid-loop | `i'm an artificial intelligence, so i don't have feelings or a state of being.` |
+
+Taught answers are still reproduced verbatim; the constraint only fires once
+the model has run out of learned continuations.
+
+## 2.2.0 — answer in the language of the question
+
+A multilingual teacher such as aya-expanse appends "(Hello! How can I assist
+you today?)" to a Greek answer, and every one of those tokens landed in the
+student's n-gram tables. Greek questions then got half-English replies.
+
+### Added
+
+* `token_language()` / `text_language()` -- script detection via codepoint
+  ranges. Numbers, punctuation and URLs are **neutral** and are never counted,
+  so a loanword does not flip a sentence: "Τι είναι η Python;" is Greek.
+* `split_segments()` / `keep_language()` -- split a reply on brackets and
+  sentence ends, drop the segments written in another language. If nothing
+  survives the original is kept: learning the wrong language beats learning
+  nothing.
+* `TeacherClient.generate(..., system=...)` and
+  `TrainingCoordinator.system_prompt()` -- the teacher is instructed to reply
+  only in the language of the question and to skip parenthetical translations.
+* `match_language` (default on) and `w_language` (default **off**).
+
+### Measured, and why w_language is off
+
+On a deliberately polluted bilingual corpus:
+
+| | language purity | mean answer | loops |
+|---|---|---|---|
+| nothing | 70% | 14.5 tokens | 3 |
+| generation penalty only | 85% | 23.2 tokens | 3 |
+| **clean the training data** | **100%** | **7.5 tokens** | **0** |
+| both | 100% | 7.5 tokens | 0 |
+
+Penalising off-language candidates during generation *looks* like the obvious
+fix and is the worse one: it fights the n-gram evidence in the middle of a
+phrase, pushing the chain off its path and into loops. Cleaning the data before
+it is learned solves the problem outright. `w_language` is kept as a tunable
+for memories that were already polluted, documented with this caveat.
+
+### Fixed
+
+* **Runaway loops are now cut off.** `TokenMemory.mean_answer_length()` tracks
+  how long a real answer usually is, and stop pressure ramps up once generation
+  overshoots it -- previously the pressure applied only when the model had *no*
+  stop evidence at all, so a trained model could still cycle to the token cap.
+
+## 2.1.4 — readable Greek, and answers that fit
+
+Two defects visible the moment a real teacher (aya-expanse) started answering
+in Greek.
+
+### Fixed
+
+* **Final sigma was rendered wrong.** `casefold()` maps ``ς`` to ``σ`` so that
+  "λόγος" and "λόγοσ" share one memory key -- correct for matching, wrong for
+  display: the user saw "πώσ" and "ωσ". `restore_final_sigma()` reinstates the
+  correct orthography at render time. It is a deterministic rule (a word-final
+  sigma in Greek is always ``ς``), so nothing extra is stored and the memory
+  key stays folded.
+* **Real answers were truncated mid-sentence.** `max_generated_tokens` was 20
+  on `tiny_android`, but a normal teacher reply is 30+ tokens, so answers were
+  cut off at the cap. Raised to 40 (96 on desktop). This is safe now that the
+  model reliably stops on `<eos>`: the cap is a guard rail, not the usual exit.
+
+## 2.1.3 — model names are resolved, not guessed
+
+`check_model()` matched on the bare stem, so with `aya-expanse:8b` installed and
+`aya-expanse` requested it reported "available" while `/api/generate` returned
+404. The diagnostic disagreed with reality -- the same silent failure as 2.1.2,
+one level up.
+
+### Fixed
+
+* `resolve_model()` maps the configured name to the **exact** installed tag
+  (`aya-expanse` -> `aya-expanse:8b`), preferring `:latest` when several tags
+  exist, and that resolved name is what gets sent. Resolution is cached and
+  falls back to the literal name when the server cannot be listed, so offline
+  use is unaffected.
+* `check_model()` now reports the resolution explicitly and is covered by a
+  test asserting it can never claim success where generation fails.
+
+## 2.1.2 — the teacher now says why it failed
+
+A reachable Ollama server with the wrong model name looked identical to no
+server at all: the startup line printed the URL (so the probe had succeeded),
+every turn printed `(teacher offline -- student only)`, and the actual reason --
+`model "tinyllama" not found, try pulling it first` -- was captured in
+`last_error` and never shown to anyone.
+
+### Fixed
+
+* **HTTP error bodies are read.** Ollama puts the real reason in the body of
+  its 4xx responses. Reporting only `HTTP Error 404` threw that away.
+* **A 4xx no longer marks the server offline.** A 4xx means the server *is*
+  talking to us, so treating it as unreachable suppressed retries for 30
+  seconds over what is usually just a bad model name.
+* **The CLI shows the reason.** A turn that falls back now prints
+  `(teacher failed -- student only)` followed by the error, and startup
+  distinguishes "unreachable" from "reachable but the model is missing".
+
+### Added
+
+* `TeacherClient.list_models()` -- reads `/api/tags`.
+* `TeacherClient.check_model()` -- returns `(ok, message)`; on a mismatch the
+  message names the requested model, lists what *is* installed and gives the
+  `ollama pull` command.
+* Startup validates the configured model against the server and warns loudly
+  before the first turn instead of failing silently on every turn.
+* `:teacher` with no argument is now a diagnostic: URL, model, reachability,
+  installed models, model check and last error.
+* `check_device.py --host` lists the installed models and fails the check when
+  the configured model is missing.
+
+## 2.1.1 — restart amnesia and offline learning
+
+### Fixed
+
+* **The model went mute after every restart.** `StudentModel.load_dict`
+  rebound `self.memory` and `self.features.memory` but left the new
+  `MarkovScorer` holding the empty memory built in `__init__`. The state file
+  was perfect and `:stats` reported the right token count, yet generation ran
+  against three special tokens and produced nothing at all. Memory rebinding is
+  now done in one place, `_bind_memory()`, and three regression tests cover it.
+* **Nothing was learned without a teacher.** `observe_sequence(input_tokens)`
+  sat inside `if teacher_text:`, so in offline mode the user's own words were
+  discarded and the memory never grew past the three specials. Input is now
+  always recorded — but deliberately *not* anchored, so questions never become
+  answer-starters and the student does not parrot them back.
+* **Offline answers ran to the token cap.** With no anchored answers there is
+  no `<eos>` evidence, so nothing could ever end. A quadratic stop pressure,
+  scaled to a target length, now applies *only* while the model has no stop
+  evidence of its own; once it has been taught even one anchored answer the
+  learned statistics are trusted unchanged.
+* The CLI now distinguishes "I have not been taught anything yet" from
+  "nothing to say about that", instead of printing `(nothing yet)` for both.
+
 ## 2.1.0 — Markov backbone for generation
 
 v2.0 could score a token but could not order one. The n-gram statistics were
@@ -143,7 +321,7 @@ the old memory file loads.
   :freeze :unfreeze :train :retrain :memory :class :debug :help`.
 * `benchmark.py` — latency, peak memory, active experts, reward/accuracy,
   memory JSON size.
-* **11 test modules, 261 tests**, standard-library `unittest` only, including
+* **12 test modules, 328 tests**, standard-library `unittest` only, including
   the mandated adaptive-neuron regressions (circle, linear, the six-point
   dataset, L1-versus-necessary-curvature) and the selective-retraining test.
 * `examples/migrate_legacy_memory.py` and `examples/session_example.md`.

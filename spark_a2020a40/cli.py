@@ -17,6 +17,7 @@ HELP_TEXT = """Commands
   :q                quit and save            :save          save now
   :stats            full statistics          :memory        memory summary
   :student <text>   answer offline only      :teacher <txt> ask Ollama only
+  :teacher          teacher diagnostics
   :feedback +1|-1   reinforce last answer    :class <text>  predict class bit
   :experts          list experts             :expert <id>   expert detail
   :freeze <id>      freeze an expert         :unfreeze <id> unfreeze it
@@ -115,9 +116,19 @@ def run(argv=None):
     print(BANNER)
     print("profile: {0} | tokens: {1} | experts: {2}".format(
         cfg.profile, len(coordinator.student.memory), len(coordinator.student.pool)))
-    print("teacher: {0}".format(
-        "offline (student only)" if args.offline or not coordinator.teacher.is_available()
-        else cfg.ollama_url()))
+    if args.offline:
+        print("teacher: offline (student only)")
+    elif coordinator.teacher.is_available():
+        print("teacher: {0}".format(cfg.ollama_url()))
+        ok, message = coordinator.teacher.check_model()
+        if not ok:
+            print("WARNING: {0}".format(message))
+            print("         the server answers, but generation will fail -- "
+                  "pass --model <name> or pull the model")
+    else:
+        print("teacher: unreachable at {0}".format(cfg.ollama_url()))
+        print("         reason: {0}".format(
+            coordinator.teacher.last_error or "no response"))
     print("type :help for commands")
 
     while True:
@@ -199,12 +210,32 @@ def handle(line, coordinator, persistence, cfg):
         print("Student: " + student.answer(line.split(None, 1)[1]))
         return True
 
+    if line == ":teacher":
+        status = coordinator.teacher.status()
+        print("url ......... {0}".format(status["url"]))
+        print("model ....... {0}".format(status["model"]))
+        available = coordinator.teacher.is_available(force=True)
+        print("reachable ... {0}".format("yes" if available else "no"))
+        if available:
+            names = coordinator.teacher.list_models(refresh=True)
+            print("installed ... {0}".format(
+                ", ".join(sorted(names)) if names else "(could not list)"))
+            ok, message = coordinator.teacher.check_model()
+            print("model check . {0}".format(message))
+        if coordinator.teacher.last_error:
+            print("last error .. {0}".format(coordinator.teacher.last_error))
+        return True
+
     if line.startswith(":teacher "):
         prompt = line.split(None, 1)[1]
         if not coordinator.teacher.is_available():
-            print("teacher offline: {0}".format(coordinator.teacher.last_error))
+            print("teacher unreachable: {0}".format(coordinator.teacher.last_error))
             return True
-        print("Teacher: " + (coordinator.teacher.generate(prompt) or "(no response)"))
+        answer = coordinator.teacher.generate(prompt)
+        if answer is None:
+            print("teacher failed: {0}".format(coordinator.teacher.last_error))
+        else:
+            print("Teacher: " + answer)
         return True
 
     if line.startswith(":feedback"):
@@ -254,8 +285,18 @@ def handle(line, coordinator, persistence, cfg):
     if report["teacher_available"]:
         print("\nTeacher: " + (report["teacher_text"] or "").strip())
     else:
-        print("\n(teacher offline -- student only)")
-    print("Student: " + (report["student_text"] or "(nothing yet)"))
+        reason = coordinator.teacher.last_error
+        if reason:
+            print("\n(teacher failed -- student only)\n  reason: {0}".format(reason))
+        else:
+            print("\n(teacher offline -- student only)")
+    if report["student_text"]:
+        print("Student: " + report["student_text"])
+    elif len(student.memory) <= 8:
+        print("Student: (I have not learned anything yet -- run me with "
+              "--host <ollama-ip> so a teacher can train me)")
+    else:
+        print("Student: (nothing to say about that yet)")
     if cfg.debug:
         print("  class: predicted={0} target={1} p={2:.3f}".format(
             report["class"]["predicted"], report["class"]["target"],

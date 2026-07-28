@@ -111,6 +111,46 @@ class TestLoading(PersistenceTestBase):
                                coordinator.student.router.arms[0].value([0.5] * 10),
                                places=3)
 
+    def test_the_model_still_answers_after_a_restart(self):
+        """Regression: v2.1.0 rebound ``student.memory`` on load but left the
+        MarkovScorer holding the empty memory built in ``__init__``.  Every
+        restart then printed "(nothing yet)" while the state file was perfect.
+        """
+        student = StudentModel(self.cfg)
+        coordinator = TrainingCoordinator(
+            self.cfg, student, OfflineTeacher(self.cfg), persistence=self.persistence)
+        for _ in range(20):
+            coordinator.process_turn("γεια σου",
+                                     teacher_text="γεια σου, χαίρομαι που σε βλέπω")
+        before = student.generate("γεια σου", greedy=True)["text"]
+        self.assertTrue(before.strip())
+        coordinator.save()
+
+        restarted = StudentModel(self.cfg)
+        restarted.load_dict(Persistence(self.cfg, self.path).load())
+        after = restarted.generate("γεια σου", greedy=True)["text"]
+        self.assertTrue(after.strip(), "the model went mute after a restart")
+        self.assertEqual(after, before)
+
+    def test_every_collaborator_shares_one_memory_after_load(self):
+        coordinator = self.make_coordinator()
+        coordinator.save()
+        restarted = StudentModel(self.cfg)
+        restarted.load_dict(Persistence(self.cfg, self.path).load())
+        self.assertIs(restarted.markov.memory, restarted.memory)
+        self.assertIs(restarted.features.memory, restarted.memory)
+        self.assertGreater(len(restarted.markov.memory), 3)
+
+    def test_contexts_and_associations_survive_a_restart(self):
+        coordinator = self.make_coordinator()
+        contexts = coordinator.student.memory.total_contexts()
+        self.assertGreater(contexts, 0)
+        coordinator.save()
+        restarted = StudentModel(self.cfg)
+        restarted.load_dict(Persistence(self.cfg, self.path).load())
+        self.assertEqual(restarted.memory.total_contexts(), contexts)
+        self.assertGreater(len(restarted.memory.associations), 0)
+
     def test_missing_file_returns_none(self):
         self.assertIsNone(Persistence(self.cfg, self.path).load())
 

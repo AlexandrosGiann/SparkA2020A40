@@ -13,7 +13,7 @@ Differences from the legacy dictionary model:
   which is roughly seven times cheaper in RAM.
 """
 
-from .tokenizer import EOS, UNK, BOS
+from .tokenizer import EOS, UNK, BOS, LANG_NEUTRAL, token_language
 
 MAX_ORDER = 3
 
@@ -28,11 +28,14 @@ def context_key(previous_two):
 
 class TokenRecord(object):
     __slots__ = ("tid", "kind", "count", "pos", "cls0", "cls1",
-                 "error_ema", "last_used")
+                 "error_ema", "last_used", "lang")
 
-    def __init__(self, tid, kind="word"):
+    def __init__(self, tid, kind="word", lang=LANG_NEUTRAL):
         self.tid = tid
         self.kind = kind
+        # Derived from the token text, so it is never serialised -- the
+        # specification says not to store what can be recomputed cheaply.
+        self.lang = lang
         self.count = 0
         # pos[0] -> successors at distance 1, pos[1] -> distance 2, ...
         self.pos = [{}, {}, {}]
@@ -55,7 +58,8 @@ class TokenMemory(object):
     """Bounded token store with positional statistics of order 1..3."""
 
     __slots__ = ("cfg", "tokens", "_free_ids", "_next_id", "_clock",
-                 "_max_count", "total_observations", "contexts", "associations")
+                 "_max_count", "total_observations", "contexts", "associations",
+                 "answer_count", "answer_tokens")
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -68,6 +72,8 @@ class TokenMemory(object):
         # Order-2 contexts: (w-2, w-1) -> {successor: count}.  These are real
         # trigram statistics; ``pos[1]``/``pos[2]`` are only skip-grams and
         # cannot answer "what follows *this pair*".
+        self.answer_count = 0
+        self.answer_tokens = 0
         self.contexts = {}
         # Topic conditioning: input token -> {response token: count}.  Without
         # it a pure Markov chain starts every answer from <bos> and therefore
@@ -107,7 +113,7 @@ class TokenMemory(object):
             tid = self._allocate_id()
             if tid is None:
                 return self.tokens.get(UNK)
-        rec = TokenRecord(tid, kind)
+        rec = TokenRecord(tid, kind, token_language(text))
         rec.last_used = self._tick()
         self.tokens[text] = rec
         return rec
@@ -187,6 +193,10 @@ class TokenMemory(object):
         texts = [t.text if hasattr(t, "text") else t for t in tokens]
         kinds = [t.kind if hasattr(t, "kind") else "word" for t in tokens]
         if anchor:
+            # Remember how long a real answer tends to be; the generator uses
+            # this to notice when it has started looping.
+            self.answer_count += 1
+            self.answer_tokens += len(texts)
             texts = [BOS] + texts + [EOS]
             kinds = ["special"] + kinds + ["special"]
         for text, kind in zip(texts, kinds):
@@ -353,6 +363,16 @@ class TokenMemory(object):
             return {}
         return rec.pos[order - 1]
 
+    def mean_answer_length(self):
+        """Average length of the anchored answers seen so far, or 0."""
+        if self.answer_count <= 0:
+            return 0.0
+        return float(self.answer_tokens) / float(self.answer_count)
+
+    def language(self, text):
+        rec = self.tokens.get(text)
+        return rec.lang if rec is not None else token_language(text)
+
     def error_probability(self, text):
         rec = self.tokens.get(text)
         return 0.5 if rec is None else rec.error_ema
@@ -441,6 +461,8 @@ class TokenMemory(object):
             "clock": self._clock,
             "max_count": self._max_count,
             "total_observations": self.total_observations,
+            "answer_count": self.answer_count,
+            "answer_tokens": self.answer_tokens,
         }
 
     @classmethod
@@ -448,7 +470,8 @@ class TokenMemory(object):
         memory = cls(cfg)
         memory.tokens = {}
         for text, entry in (data.get("tokens") or {}).items():
-            rec = TokenRecord(int(entry.get("id", 0)), entry.get("k", "word"))
+            rec = TokenRecord(int(entry.get("id", 0)), entry.get("k", "word"),
+                              token_language(text))
             rec.count = int(entry.get("c", 0))
             rec.pos = [
                 dict(entry.get("p1") or {}),
@@ -469,6 +492,8 @@ class TokenMemory(object):
         memory._clock = int(data.get("clock", 0))
         memory._max_count = max(1, int(data.get("max_count", 1)))
         memory.total_observations = int(data.get("total_observations", 0))
+        memory.answer_count = int(data.get("answer_count", 0))
+        memory.answer_tokens = int(data.get("answer_tokens", 0))
         for special in (UNK, BOS, EOS):
             memory.ensure(special, kind="special")
         return memory

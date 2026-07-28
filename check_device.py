@@ -191,6 +191,12 @@ def teacher_probe(host, port):
     client = TeacherClient(cfg)
     if not client.is_available(force=True):
         raise RuntimeError(client.last_error or "no response")
+    names = client.list_models(refresh=True)
+    ok, message = client.check_model()
+    if not ok:
+        raise RuntimeError(message)
+    if names:
+        return "reachable; models: " + ", ".join(sorted(names))
     return "reachable at " + cfg.ollama_url("/")
 
 

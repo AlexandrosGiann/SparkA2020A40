@@ -138,6 +138,15 @@ ss -ltnp | grep 11434          # expect *:11434
 Check from the phone's browser: `http://YOUR_PC_IP:11434` should say
 `Ollama is running`.
 
+Verify the model you intend to use is actually installed — a wrong `--model` is
+the most common reason the teacher "does not connect" while the server is
+plainly reachable:
+
+```bash
+ollama list                     # on the laptop
+python3 -m spark_a2020a40 ...   # then :teacher inside the REPL
+```
+
 Then, on the phone:
 
 ```bash
@@ -319,6 +328,23 @@ statistics, and the legacy `tags` are kept under `state['legacy']['tags']` so
 nothing is lost. The old file is never modified.
 
 ---
+
+## Language
+
+The student answers in the language of the question. Two levers, and the
+non-obvious one is the one that works:
+
+* **`match_language`** (on) strips foreign-language asides from the teacher's
+  reply *before* it is learned, and the teacher is given a system prompt asking
+  it to reply only in the question's language.
+* **`w_language`** (off) would penalise off-language candidates during
+  generation. Measured at 85% purity versus 100% for cleaning, and it caused
+  loops — it fights the n-gram evidence mid-phrase. Raise it only to clean up
+  an already-polluted memory.
+
+Script detection treats numbers, punctuation and URLs as neutral, so loanwords
+survive: `Τι είναι η Python;` is Greek, and `Python` is not stripped from the
+answer.
 
 ## Tokenizer
 

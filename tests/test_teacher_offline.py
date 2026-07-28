@@ -168,5 +168,172 @@ class TestTeacherWhenAvailable(unittest.TestCase):
         self.assertIsInstance(report["student_text"], str)
 
 
+class WrongModelTeacher(TeacherClient):
+    """Server is up and answers /, but the requested model is not installed."""
+
+    def __init__(self, cfg, installed=("llama3.2:latest", "qwen2.5:0.5b")):
+        TeacherClient.__init__(self, cfg)
+        import io
+        import urllib.error
+        tags = json.dumps({"models": [{"name": n} for n in installed]})
+
+        class _Opener(object):
+            def open(self_inner, request, timeout=None):
+                url = request.full_url
+                if url.endswith("/"):
+                    return FakeResponse("Ollama is running")
+                if url.endswith("/api/tags"):
+                    return FakeResponse(tags)
+                raise urllib.error.HTTPError(
+                    url, 404, "Not Found", {},
+                    io.BytesIO(json.dumps(
+                        {"error": 'model "%s" not found, try pulling it first'
+                                  % cfg.ollama_model}).encode()))
+
+        self._opener = _Opener()
+
+
+class TestDiagnosableFailures(unittest.TestCase):
+    """A silent None is useless: the user must be told what went wrong."""
+
+    def setUp(self):
+        self.cfg = Config()
+        self.cfg.ollama_model = "tinyllama"
+        self.teacher = WrongModelTeacher(self.cfg)
+
+    def test_the_server_looks_available(self):
+        self.assertTrue(self.teacher.is_available())
+
+    def test_generation_still_fails(self):
+        self.assertIsNone(self.teacher.generate("γεια"))
+
+    def test_the_error_names_the_actual_problem(self):
+        self.teacher.generate("γεια")
+        self.assertIn("not found", self.teacher.last_error)
+        self.assertIn("404", self.teacher.last_error)
+
+    def test_models_can_be_listed(self):
+        self.assertEqual(sorted(self.teacher.list_models()),
+                         ["llama3.2:latest", "qwen2.5:0.5b"])
+
+    def test_check_model_reports_the_mismatch_and_the_alternatives(self):
+        ok, message = self.teacher.check_model()
+        self.assertFalse(ok)
+        self.assertIn("tinyllama", message)
+        self.assertIn("llama3.2:latest", message)
+        self.assertIn("ollama pull", message)
+
+    def test_check_model_accepts_a_tag_variant(self):
+        cfg = Config()
+        cfg.ollama_model = "llama3.2"
+        teacher = WrongModelTeacher(cfg)
+        ok, _ = teacher.check_model()
+        self.assertTrue(ok)
+
+    def test_an_http_error_does_not_mark_the_server_offline(self):
+        """A 4xx means the server is talking to us; do not stop retrying for
+        30 seconds over a bad model name."""
+        self.teacher.generate("γεια")
+        self.assertTrue(self.teacher.is_available())
+
+    def test_a_network_error_does_mark_the_server_offline(self):
+        teacher = UnreachableTeacher(Config())
+        teacher._available = True
+        teacher.generate("γεια")
+        self.assertFalse(teacher._available)
+
+    def test_empty_server_is_reported(self):
+        teacher = WrongModelTeacher(self.cfg, installed=())
+        ok, message = teacher.check_model()
+        self.assertFalse(ok)
+        self.assertIn("no models installed", message)
+
+
+class InstalledModelTeacher(TeacherClient):
+    """A server that behaves like Ollama: only *exact* model names work."""
+
+    def __init__(self, cfg, installed):
+        TeacherClient.__init__(self, cfg)
+        import io
+        import urllib.error
+        tags = json.dumps({"models": [{"name": n} for n in installed]})
+
+        class _Opener(object):
+            def open(self_inner, request, timeout=None):
+                url = request.full_url
+                if url.endswith("/"):
+                    return FakeResponse("Ollama is running")
+                if url.endswith("/api/tags"):
+                    return FakeResponse(tags)
+                name = json.loads(request.data.decode("utf-8"))["model"]
+                if name in installed or (name + ":latest") in installed:
+                    return FakeResponse(json.dumps({"response": "γεια σου φίλε"}))
+                raise urllib.error.HTTPError(
+                    url, 404, "Not Found", {},
+                    io.BytesIO(json.dumps(
+                        {"error": 'model "%s" not found' % name}).encode()))
+
+        self._opener = _Opener()
+
+
+class TestModelNameResolution(unittest.TestCase):
+    """Ollama rejects "aya-expanse" when "aya-expanse:8b" is what is installed."""
+
+    def client(self, installed, wanted):
+        cfg = Config()
+        cfg.ollama_model = wanted
+        return InstalledModelTeacher(cfg, installed)
+
+    def test_bare_name_resolves_to_the_installed_tag(self):
+        teacher = self.client(["aya-expanse:8b"], "aya-expanse")
+        self.assertEqual(teacher.resolve_model(), "aya-expanse:8b")
+
+    def test_generation_succeeds_with_a_bare_name(self):
+        teacher = self.client(["aya-expanse:8b"], "aya-expanse")
+        self.assertIsNotNone(teacher.generate("γεια"))
+
+    def test_the_resolved_name_is_what_gets_sent(self):
+        teacher = self.client(["aya-expanse:8b"], "aya-expanse")
+        teacher.generate("γεια")
+        self.assertEqual(teacher._resolved, "aya-expanse:8b")
+
+    def test_latest_is_preferred_when_several_tags_exist(self):
+        teacher = self.client(
+            ["aya-expanse:8b", "aya-expanse:latest"], "aya-expanse")
+        self.assertEqual(teacher.resolve_model(), "aya-expanse:latest")
+
+    def test_exact_name_is_left_alone(self):
+        teacher = self.client(["aya-expanse:8b"], "aya-expanse:8b")
+        self.assertEqual(teacher.resolve_model(), "aya-expanse:8b")
+
+    def test_unknown_model_does_not_resolve(self):
+        teacher = self.client(["aya-expanse:8b"], "tinyllama")
+        self.assertIsNone(teacher.resolve_model())
+        self.assertIsNone(teacher.generate("γεια"))
+
+    def test_check_model_agrees_with_generation(self):
+        """The diagnostic must never claim success where generation fails."""
+        cases = [
+            (["aya-expanse:8b"], "aya-expanse"),
+            (["aya-expanse:latest"], "aya-expanse"),
+            (["aya-expanse:8b"], "aya-expanse:8b"),
+            (["aya-expanse:8b"], "tinyllama"),
+            (["llama3.2:latest", "aya-expanse:8b"], "aya-expanse"),
+        ]
+        for installed, wanted in cases:
+            teacher = self.client(installed, wanted)
+            ok, message = teacher.check_model()
+            produced = teacher.generate("γεια") is not None
+            self.assertEqual(ok, produced,
+                             "{0} / {1}: {2}".format(installed, wanted, message))
+
+    def test_resolution_survives_an_unlistable_server(self):
+        cfg = Config()
+        cfg.ollama_model = "aya-expanse"
+        teacher = UnreachableTeacher(cfg)
+        self.assertIsNone(teacher.resolve_model())
+        self.assertIsNone(teacher.generate("γεια"))
+
+
 if __name__ == "__main__":
     unittest.main()

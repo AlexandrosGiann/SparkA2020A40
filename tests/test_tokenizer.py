@@ -6,7 +6,7 @@ import unittest
 from . import _bootstrap  # noqa: F401
 from spark_a2020a40.tokenizer import (KIND_NUMBER, KIND_OP, KIND_PUNCT,
                                       KIND_URL, KIND_WORD, Tokenizer,
-                                      normalize_text)
+                                      normalize_text, restore_final_sigma)
 
 
 class TestGreek(unittest.TestCase):
@@ -148,6 +148,48 @@ class TestBoundsAndHelpers(unittest.TestCase):
         tokenizer = Tokenizer()
         tokens = tokenizer.tokenize_typed("λέξη")
         self.assertEqual(tokens[0].kind, KIND_WORD)
+
+
+class TestFinalSigmaRendering(unittest.TestCase):
+    """casefold() flattens ς to σ for matching; display must undo it."""
+
+    def test_word_final_sigma_is_restored(self):
+        for folded, expected in (("ωσ", "ως"), ("πώσ", "πώς"),
+                                 ("λόγοσ", "λόγος"), ("κάνεισ", "κάνεις"),
+                                 ("ερωτήσεισ", "ερωτήσεις"), ("μασ", "μας")):
+            self.assertEqual(restore_final_sigma(folded), expected)
+
+    def test_internal_sigma_is_left_alone(self):
+        for text in ("σήμερα", "συναισθήματα", "κόσμος".casefold(), "σοσ"):
+            restored = restore_final_sigma(text)
+            self.assertEqual(restored.count("ς"), 1 if text.endswith("σ") else 0,
+                             text + " -> " + restored)
+
+    def test_non_greek_is_untouched(self):
+        for text in ("hello", "class", "os", "https://a.com"):
+            self.assertEqual(restore_final_sigma(text), text)
+
+    def test_lone_sigma_is_untouched(self):
+        self.assertEqual(restore_final_sigma("σ"), "σ")
+
+    def test_detokenize_renders_correct_greek(self):
+        tokenizer = Tokenizer()
+        tokens = tokenizer.tokenize("Πώς είσαι; Ως τεχνητή νοημοσύνη.")
+        rendered = tokenizer.detokenize(tokens)
+        self.assertIn("πώς", rendered)
+        self.assertIn("ως", rendered)
+        self.assertNotIn("πώσ", rendered)
+        self.assertNotIn("ωσ ", rendered)
+
+    def test_detokenize_can_be_asked_not_to_restore(self):
+        tokenizer = Tokenizer()
+        raw = tokenizer.detokenize(["πώσ"], restore_sigma=False)
+        self.assertEqual(raw, "πώσ")
+
+    def test_matching_still_collapses_both_spellings(self):
+        """The memory key must stay folded -- only rendering changes."""
+        tokenizer = Tokenizer()
+        self.assertEqual(tokenizer.tokenize("λόγος"), tokenizer.tokenize("λόγοσ"))
 
 
 if __name__ == "__main__":
